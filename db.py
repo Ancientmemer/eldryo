@@ -1,47 +1,52 @@
 # db.py
-# Manglish comments: DB connection and helpers
-from pymongo import MongoClient
-import os
+# Manglish comments - MongoDB helper
+from motor.motor_asyncio import AsyncIOMotorClient
+from datetime import datetime
+from typing import List
 
-MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = os.getenv("DB_NAME", "telegram_bot_db")
+class MongoDB:
+    def __init__(self, uri: str):
+        self.uri = uri
+        self.client = None
+        self.db = None
 
-if not MONGO_URI:
-    raise RuntimeError("Set MONGO_URI env var first")
+    async def connect(self):
+        self.client = AsyncIOMotorClient(self.uri)
+        self.db = self.client.get_default_database() or self.client["telegram_bot_db"]
+        # create indexes for quick stats
+        await self.db.users.create_index("id", unique=True)
+        await self.db.groups.create_index("id", unique=True)
+        await self.db.files.create_index([("user_id", 1)])
+        await self.db.indexes.create_index([("original_chat", 1), ("original_message_id", 1)], unique=False)
 
-client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
+    async def close(self):
+        if self.client:
+            self.client.close()
 
-# Collections
-users_col = db["users"]     # stores chat info (users + groups)
-files_col = db["files"]     # stores metadata for uploaded files
-broadcasts_col = db["broadcasts"]  # optional history of broadcasts
+    async def upsert_user(self, user_id: int, user_obj: dict):
+        await self.db.users.update_one({"id": user_id}, {"$set": {"id": user_id, "data": user_obj, "updated_at": datetime.utcnow()}}, upsert=True)
 
-# Helper upserts
-def upsert_chat(chat):
-    """
-    chat: dict with keys id, type, title, username, first_name, last_name
-    """
-    users_col.update_one(
-        {"chat_id": chat["id"]},
-        {"$set": chat},
-        upsert=True
-    )
+    async def upsert_group(self, group_id: int, group_obj: dict):
+        await self.db.groups.update_one({"id": group_id}, {"$set": {"id": group_id, "data": group_obj, "updated_at": datetime.utcnow()}}, upsert=True)
 
-def add_file(meta: dict):
-    """
-    meta: dict describing file (file_id, file_unique_id, file_type, chat_id, from_id, date, caption)
-    """
-    files_col.insert_one(meta)
+    async def insert_file(self, doc: dict):
+        await self.db.files.insert_one(doc)
 
-def stats():
-    return {
-        "total_users": users_col.count_documents({"type": "private"}),
-        "total_groups": users_col.count_documents({"type": {"$ne": "private"}}),
-        "total_files": files_col.count_documents({})
-    }
+    async def insert_index(self, doc: dict):
+        await self.db.indexes.insert_one(doc)
 
-def get_all_user_chat_ids(batch_size=1000):
-    # Only return private chats (users), for broadcast
-    cursor = users_col.find({"type": "private"}, {"chat_id": 1})
-    return [r["chat_id"] for r in cursor]
+    async def mark_file_deleted_by_forward(self, chat_id:int, message_id:int):
+        await self.db.files.update_many({"forwarded_to_db": message_id}, {"$set": {"deleted_from_db": True, "deleted_at": datetime.utcnow()}})
+
+    async def count_files(self) -> int:
+        return await self.db.files.count_documents({})
+
+    async def count_users(self) -> int:
+        return await self.db.users.count_documents({})
+
+    async def count_groups(self) -> int:
+        return await self.db.groups.count_documents({})
+
+    async def get_all_user_ids(self) -> List[int]:
+        cur = self.db.users.find({}, {"id": 1})
+        return [d["id"] async for d in cur]
