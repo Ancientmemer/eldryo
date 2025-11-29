@@ -1,285 +1,252 @@
 # main.py
-# FastAPI webhook bot for Telegram: auto-filter + stats + broadcast + file DB
-# Manglish comments where helpful
-
+# Manglish comments inside
 import os
-import json
-import httpx
+import asyncio
 import traceback
+from typing import Optional
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
-from typing import Optional, List
-from db import upsert_chat, add_file, stats, get_all_user_chat_ids, broadcasts_col
-from db import db  # only if you want to access directly
-from dotenv import load_dotenv
+import httpx
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel
+from datetime import datetime, timedelta
 
-load_dotenv()
+# local modules
+from db import MongoDB
+from config import (
+    TELEGRAM_BOT_TOKEN, TELEGRAM_API, DB_CHANNEL_ID,
+    MONGO_URI, OWNER_ID, FORCE_SUB_CHANNEL, AUTO_DELETE_SECONDS
+)
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-EXPOSED_URL = os.getenv("EXPOSED_URL")
-PORT = int(os.getenv("PORT", "8080"))
-ADMIN_IDS = os.getenv("ADMIN_IDS", "")  # comma separated telegram numeric ids
-ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS.split(",") if x.strip()]
-
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var first")
-
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 app = FastAPI()
+mongo = MongoDB(MONGO_URI)
+# Ensure db connection on startup
+@app.on_event("startup")
+async def startup():
+    await mongo.connect()
 
-# -----------------------
-# Utility helpers
-# -----------------------
-async def telegram_request(method: str, payload: dict):
-    url = f"{TELEGRAM_API}/{method}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(url, json=payload)
-        try:
-            return resp.json()
-        except Exception:
-            return {"ok": False, "status": resp.status_code, "text": resp.text}
+@app.on_event("shutdown")
+async def shutdown():
+    await mongo.close()
 
-async def send_message(chat_id: int, text: str, reply_markup: Optional[dict] = None, parse_mode: Optional[str] = None):
-    payload = {"chat_id": chat_id, "text": text}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    return await telegram_request("sendMessage", payload)
+# small helper to send telegram messages
+async def tg_post(path: str, data: dict):
+    url = f"{TELEGRAM_API}/{path}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(url, data=data)
+        return r
 
-
-def make_start_buttons():
-    # Manglish: simple inline buttons for /help and contact
-    kb = {
-        "inline_keyboard": [
-            [{"text": "Help / Commands", "callback_data": "help_cb"}],
-            [{"text": "Add to Channel/Group", "callback_data": "add_group_cb"}]
-        ]
+async def forward_to_db_channel(chat_id:int, message_id:int):
+    """
+    Manglish: Forward the message to DB channel and return the forwarded message_id.
+    """
+    data = {
+        "chat_id": DB_CHANNEL_ID,
+        "from_chat_id": chat_id,
+        "message_id": message_id
     }
-    return kb
+    resp = await tg_post("forwardMessage", data)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Forward failed: {resp.status_code} {resp.text}")
+    return (await resp.json())["result"]["message_id"]
 
-# -----------------------
-# Filtering - placeholder
-# -----------------------
-def apply_filters(message: dict) -> bool:
-    """
-    Manglish: put your filter rules here.
-    If returns True -> message should be flagged/removed (bot can instruct admins).
-    Right now it's a stub. Add rules like banned words, file type restrictions, spam heuristics.
-    """
-    text = (message.get("text") or "").lower()
-    # example rule: block message containing 'badword'
-    banned_words = ["badword1", "badword2"]
-    for w in banned_words:
-        if w in text:
-            return True
-    return False
+async def delete_message(chat_id:int, message_id:int):
+    await tg_post("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
 
-# -----------------------
-# Background tasks
-# -----------------------
-async def broadcast_to_all(text: str):
-    # Manglish: broadcast to all private users saved in DB
-    chat_ids = get_all_user_chat_ids()
-    success = 0
-    fail = 0
-    for cid in chat_ids:
+async def send_message(chat_id:int, text:str, reply_markup:Optional[dict]=None):
+    data = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+    await tg_post("sendMessage", data)
+
+# Background task: schedule delete a message after AUTO_DELETE_SECONDS (only groups)
+async def schedule_auto_delete(chat_id:int, message_id:int):
+    await asyncio.sleep(AUTO_DELETE_SECONDS)
+    try:
+        await delete_message(chat_id, message_id)
+    except Exception:
+        # ignore delete failures
+        pass
+
+# Handle user commands and all messages
+async def handle_agent(update: dict, background_tasks: BackgroundTasks):
+    msg = update.get("message") or {}
+    if not msg:
+        return
+
+    chat = msg.get("chat", {})
+    chat_id = chat.get("id")
+    chat_type = chat.get("type", "private")
+    from_user = msg.get("from", {})
+    user_id = from_user.get("id")
+    text = msg.get("text", "") or msg.get("caption", "") or ""
+    message_id = msg.get("message_id")
+
+    # Force-sub check
+    if FORCE_SUB_CHANNEL:
+        # check membership
+        resp = await tg_post("getChatMember", {"chat_id": FORCE_SUB_CHANNEL, "user_id": user_id})
+        if resp.status_code != 200:
+            # treat as not member
+            await send_message(chat_id, "You must join the required channel to use this bot.")
+            return
+        res = await resp.json()
+        status = res.get("result", {}).get("status")
+        if status in ("left", "kicked", None):
+            await send_message(chat_id, "Please join the channel to use the bot.")
+            return
+
+    # save user / group
+    try:
+        if chat_type == "private":
+            await mongo.upsert_user(user_id, from_user)
+        else:
+            await mongo.upsert_group(chat_id, chat)
+    except Exception:
+        traceback.print_exc()
+
+    # commands
+    if text.startswith("/start"):
+        # show buttons (inline keyboard)
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "Help", "callback_data": "help"}],
+                [{"text": "Stats", "callback_data": "stats"}]
+            ]
+        }
+        await send_message(chat_id, "Hello! I'm your Auto-Filter Bot. Use /help to see commands.", reply_markup=keyboard)
+        return
+
+    if text.startswith("/help"):
+        help_text = (
+            "/start - Start & buttons\n"
+            "/help - This message\n"
+            "/stats - Total files, users, groups\n"
+            "/broadcast <text> - Owner only, send to all users\n"
+            "/deletefile - Reply to a forwarded DB-channel message in PM to delete it from DB channel\n\n"
+            "File behavior: When you send or forward files to the bot (in group or PM), I will forward them to the DB channel and store metadata. Group messages are auto-deleted after configured time (5 minutes)."
+        )
+        await send_message(chat_id, help_text)
+        return
+
+    if text.startswith("/stats"):
+        files_count = await mongo.count_files()
+        users_count = await mongo.count_users()
+        groups_count = await mongo.count_groups()
+        await send_message(chat_id, f"Files: {files_count}\nUsers: {users_count}\nGroups: {groups_count}")
+        return
+
+    if text.startswith("/broadcast"):
+        # owner-only
+        if str(user_id) != str(OWNER_ID):
+            await send_message(chat_id, "Only owner can use /broadcast")
+            return
+        payload = text.split(" ", 1)
+        if len(payload) < 2:
+            await send_message(chat_id, "Usage: /broadcast <message text>")
+            return
+        message = payload[1]
+        # broadcast to users only to avoid spam in groups (you can modify)
+        users = await mongo.get_all_user_ids()
+        sent = 0
+        for u in users:
+            try:
+                await send_message(u, message)
+                sent += 1
+            except Exception:
+                pass
+        await send_message(chat_id, f"Broadcast sent to {sent} users.")
+        return
+
+    # /deletefile: only works in private chat when replying to a forwarded db-channel message
+    if text.startswith("/deletefile"):
+        # must be reply_to_message
+        reply = msg.get("reply_to_message")
+        if not reply:
+            await send_message(chat_id, "Reply to the forwarded DB-channel message you want to delete.")
+            return
+        # We expect the replied message to be a forwarded message from DB channel
+        fwd = reply.get("forward_from_chat") or reply.get("forward_from")
+        # If user forwarded the DB-channel message to bot, the forwarded message has forward_from_chat.id == DB_CHANNEL_ID
+        if (reply.get("forward_from_chat") and reply["forward_from_chat"].get("id") == DB_CHANNEL_ID) or reply.get("forward_from") and isinstance(reply.get("forward_from"), dict) and reply["forward_from"].get("id") == DB_CHANNEL_ID:
+            target_mid = reply.get("message_id")
+            try:
+                await delete_message(DB_CHANNEL_ID, target_mid)
+                # Update DB record status
+                await mongo.mark_file_deleted_by_forward(DB_CHANNEL_ID, target_mid)
+                await send_message(chat_id, "Deleted from DB channel.")
+            except Exception as e:
+                await send_message(chat_id, f"Delete failed: {e}")
+        else:
+            await send_message(chat_id, "That message is not a forwarded DB-channel message.")
+        return
+
+    # If message contains a file (photo, document, audio, video, voice, sticker)
+    file_keys = ["photo", "document", "video", "audio", "voice", "sticker"]
+    has_file = any(k in msg for k in file_keys)
+    if has_file or msg.get("forward_from") or msg.get("forward_from_chat"):
+        # store file metadata
+        saved = None
         try:
-            await send_message(cid, text)
-            success += 1
+            fwd_from = msg.get("forward_from_chat") or msg.get("forward_from")
+            orig_chat = None
+            orig_msg_id = None
+            if fwd_from:
+                # it's forwarded from some chat
+                orig_chat = fwd_from.get("id") if isinstance(fwd_from, dict) else None
+                orig_msg_id = msg.get("forward_from_message_id")
+            forwarded_message_id = None
+            try:
+                forwarded_message_id = await forward_to_db_channel(chat_id, message_id)
+            except Exception as e:
+                traceback.print_exc()
+                forwarded_message_id = None
+
+            # index info
+            file_record = {
+                "user_id": user_id,
+                "from_chat_id": chat_id,
+                "chat_type": chat_type,
+                "message_id": message_id,
+                "forwarded_to_db": forwarded_message_id,
+                "original_chat": orig_chat,
+                "original_message_id": orig_msg_id,
+                "timestamp": datetime.utcnow()
+            }
+            await mongo.insert_file(file_record)
+            # if forwarded_message_id exists, save index mapping
+            if forwarded_message_id and orig_chat and orig_msg_id:
+                await mongo.insert_index({
+                    "original_chat": orig_chat,
+                    "original_message_id": orig_msg_id,
+                    "db_channel_message_id": forwarded_message_id,
+                    "added_at": datetime.utcnow()
+                })
         except Exception:
-            fail += 1
-    # store broadcast history
-    broadcasts_col.insert_one({"text": text, "success": success, "fail": fail})
-    return {"success": success, "fail": fail}
+            traceback.print_exc()
 
+        # If message is in a group, schedule auto-delete
+        if chat_type != "private":
+            background_tasks.add_task(schedule_auto_delete, chat_id, message_id)
 
-# -----------------------
-# Routes
-# -----------------------
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+        # reply ack
+        await send_message(chat_id, "Saved and forwarded to DB channel ✅")
+        return
+
+    # fallback: simple echo/ignore
+    return
 
 @app.post("/webhook")
 async def webhook(req: Request, background_tasks: BackgroundTasks):
     update = await req.json()
-
-    # 1) handle callback_query (buttons)
-    if "callback_query" in update:
-        cb = update["callback_query"]
-        data = cb.get("data")
-        from_user = cb.get("from", {})
-        chat_id = cb.get("message", {}).get("chat", {}).get("id")
-        if data == "help_cb":
-            background_tasks.add_task(send_message, from_user["id"], HELP_TEXT)
-        elif data == "add_group_cb":
-            # Instructions for adding to groups
-            txt = ("To add this bot to a channel or group: add the bot as admin and then send any message "
-                   "from that group to register it in DB. Files posted in that group will be saved to DB.")
-            background_tasks.add_task(send_message, from_user["id"], txt)
-        return {"ok": True}
-
-    msg = update.get("message") or update.get("edited_message")
-    if not msg:
-        return {"ok": True}
-
-    chat = msg.get("chat", {})
-    from_user = msg.get("from", {})
-    chat_obj = {
-        "id": chat.get("id"),
-        "type": chat.get("type"),
-        "title": chat.get("title"),
-        "username": chat.get("username"),
-        "first_name": from_user.get("first_name"),
-        "last_name": from_user.get("last_name")
-    }
-    # upsert chat into DB
-    try:
-        upsert_chat(chat_obj)
-    except Exception:
-        traceback.print_exc()
-
-    # if command
-    text = msg.get("text", "") or ""
-    if text.startswith("/"):
-        parts = text.split(" ", 1)
-        cmd = parts[0].lower()
-        args = parts[1] if len(parts) > 1 else ""
-        # /start
-        if cmd == "/start":
-            welcome = ("Hello! I'm your Advanced Auto-Filter Bot.\n\n"
-                       "Use /help to see commands.")
-            background_tasks.add_task(send_message, chat["id"], welcome, make_start_buttons())
-            return {"ok": True}
-
-        # /help
-        if cmd == "/help":
-            background_tasks.add_task(send_message, chat["id"], HELP_TEXT)
-            return {"ok": True}
-
-        # /stats
-        if cmd == "/stats":
-            s = stats()
-            stats_text = (
-                f"📊 Stats:\n"
-                f"- Total users (private): {s['total_users']}\n"
-                f"- Total groups/channels: {s['total_groups']}\n"
-                f"- Total files collected: {s['total_files']}\n"
-            )
-            background_tasks.add_task(send_message, chat["id"], stats_text)
-            return {"ok": True}
-
-        # /broadcast (admin only)
-        if cmd == "/broadcast":
-            if from_user.get("id") not in ADMIN_IDS:
-                background_tasks.add_task(send_message, chat["id"], "❌ You are not allowed to broadcast.")
-                return {"ok": True}
-            if not args.strip():
-                background_tasks.add_task(send_message, chat["id"], "Usage: /broadcast <message text>")
-                return {"ok": True}
-            background_tasks.add_task(broadcast_to_all, args.strip())
-            background_tasks.add_task(send_message, chat["id"], "Broadcast started. Check history later.")
-            return {"ok": True}
-
-    # Non-command message: check filters and file handling
-    try:
-        # apply filters
-        if apply_filters(msg):
-            # simple behavior: notify user and admins (not deleting for now)
-            note = "Your message matched the filter rules. Please check rules."
-            background_tasks.add_task(send_message, chat["id"], note)
-            # optionally notify admins
-            for admin in ADMIN_IDS:
-                background_tasks.add_task(send_message, admin, f"Filter matched in chat {chat.get('id')}: {text[:200]}")
-            # you can also call deleteMessage via Telegram API if you want:
-            # await telegram_request("deleteMessage", {"chat_id": chat["id"], "message_id": msg["message_id"]})
-            return {"ok": True}
-    except Exception:
-        traceback.print_exc()
-
-    # Files detection - save metadata
-    try:
-        file_meta = None
-        if "document" in msg:
-            d = msg["document"]
-            file_meta = {
-                "file_type": "document",
-                "file_id": d.get("file_id"),
-                "file_unique_id": d.get("file_unique_id"),
-                "file_name": d.get("file_name"),
-                "mime_type": d.get("mime_type")
-            }
-        elif "photo" in msg:
-            # photo is a list, take largest
-            ph = msg["photo"][-1]
-            file_meta = {
-                "file_type": "photo",
-                "file_id": ph.get("file_id"),
-                "file_unique_id": ph.get("file_unique_id"),
-                "width": ph.get("width"),
-                "height": ph.get("height")
-            }
-        elif "video" in msg:
-            v = msg["video"]
-            file_meta = {
-                "file_type": "video",
-                "file_id": v.get("file_id"),
-                "file_unique_id": v.get("file_unique_id"),
-                "duration": v.get("duration")
-            }
-        elif "voice" in msg:
-            v = msg["voice"]
-            file_meta = {
-                "file_type": "voice",
-                "file_id": v.get("file_id"),
-                "file_unique_id": v.get("file_unique_id"),
-                "duration": v.get("duration")
-            }
-        elif "audio" in msg:
-            a = msg["audio"]
-            file_meta = {
-                "file_type": "audio",
-                "file_id": a.get("file_id"),
-                "file_unique_id": a.get("file_unique_id"),
-                "duration": a.get("duration")
-            }
-
-        if file_meta:
-            file_meta.update({
-                "chat_id": chat.get("id"),
-                "from_id": from_user.get("id"),
-                "date": msg.get("date"),
-                "caption": msg.get("caption")
-            })
-            add_file(file_meta)
-            # optional: reply to user that file is saved
-            background_tasks.add_task(send_message, chat["id"], "File saved to DB ✅")
-    except Exception:
-        traceback.print_exc()
-
+    background_tasks.add_task(handle_agent, update, background_tasks)
     return {"ok": True}
 
-# -----------------------
-# Webhook setter
-# -----------------------
 @app.get("/set_webhook")
 async def set_webhook():
-    if not EXPOSED_URL:
+    exposed = os.getenv("EXPOSED_URL")
+    if not exposed:
         raise HTTPException(status_code=400, detail="Set EXPOSED_URL env var first")
-    webhook_url = f"{EXPOSED_URL}/webhook"
+    webhook_url = f"{exposed}/webhook"
     async with httpx.AsyncClient() as client:
         resp = await client.get(f"{TELEGRAM_API}/setWebhook", params={"url": webhook_url})
         return resp.json()
-
-# -----------------------
-# Constants
-# -----------------------
-HELP_TEXT = (
-    "🤖 Advanced Auto-Filter Bot — Commands:\n\n"
-    "/start - start and show buttons\n"
-    "/help - this help text\n"
-    "/stats - show total users/groups/files\n"
-    "/broadcast <text> - admin only, send text to all saved private users\n\n"
-    "How files work: Any file (photo/document/video/audio/voice) posted in a chat where the bot is present will be recorded into the DB. Use /stats to view totals.\n\n"
-    "You can add filtering rules in the bot code (apply_filters function)."
-            )
