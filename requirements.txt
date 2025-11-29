@@ -1,6 +1,5 @@
 fastapi
 uvicorn[standard]
 httpx
-python-dotenv
-motor
 pymongo
+python-dotenv
