@@ -1,25 +1,9 @@
-# db.py
+# optional: not required if above main.py used
 from motor.motor_asyncio import AsyncIOMotorClient
-from config import MONGO_URI, DB_NAME
+import os
 
-class Mongo:
-    def __init__(self):
-        self.client = None
-        self.db = None
+MONGO_URI = os.getenv("MONGO_URI")
+DB_NAME = os.getenv("DB_NAME")
 
-    async def connect(self):
-        if not MONGO_URI:
-            raise RuntimeError("MONGO_URI env var not set")
-        self.client = AsyncIOMotorClient(MONGO_URI)
-        # ensure db name:
-        self.db = self.client.get_default_database() if self.client.get_default_database() else self.client[DB_NAME]
-        # ensure indexes
-        await self.db.users.create_index("user_id", unique=True)
-        await self.db.files.create_index("file_id")
-        await self.db.groups.create_index("chat_id", unique=True)
-
-    async def close(self):
-        if self.client:
-            self.client.close()
-
-mongo = Mongo()
+client = AsyncIOMotorClient(MONGO_URI)
+db = client[DB_NAME]
