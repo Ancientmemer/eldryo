@@ -1,4 +1,4 @@
-# main.py (PM-delivery version)
+# main.py (PM-delivery version with robust broadcast)
 import os
 import logging
 import asyncio
@@ -444,7 +444,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                     log.exception("start payload handling failed")
                     await tg_send_message(chat_id, "Welcome! Use /help to see commands.")
             else:
-                await tg_send_message(chat_id, "Hello! I am Eldro Auto Filter Bot. Use /help to see commands.\n\n ᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links", reply_markup=buttons_for_start())
+                await tg_send_message(chat_id, "Hello! I am Eldryo The Auto Filter Bot. Use /help to see commands.\n\n ᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links\nᴅᴇᴠᴇʟᴏᴩᴇᴅ ʙʏ: @iam_eldro", reply_markup=buttons_for_start())
             return {"ok": True}
 
         # /help
@@ -582,26 +582,94 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             await tg_send_message(chat_id, "Reply to the forwarded DB-channel message (in private) with /deletefile to delete it.")
             return {"ok": True}
 
-        # If owner had a broadcast pending, consume it and broadcast
+        # If owner had a broadcast pending, consume it and broadcast (robust, supports long texts)
         session = await db.sessions.find_one({"user_id": user_id})
         if session and session.get("broadcast_pending"):
             await db.sessions.delete_one({"user_id": user_id})
+
+            # helper to split long text into Telegram-safe chunks
+            def split_text_into_chunks(text: str, chunk_size: int = 4000):
+                if not text:
+                    return []
+                chunks = []
+                start = 0
+                length = len(text)
+                while start < length:
+                    end = start + chunk_size
+                    # try to cut at newline or space for nicer splits
+                    if end < length:
+                        # look back for newline within last 200 chars
+                        look_back = max(start, end - 200)
+                        idx = text.rfind("\n", look_back, end)
+                        if idx == -1:
+                            idx = text.rfind(" ", look_back, end)
+                        if idx != -1 and idx > start:
+                            end = idx
+                    chunks.append(text[start:end].rstrip())
+                    start = end
+                return chunks
+
+            # collect all target chats
             cur = db.chats.find({})
             targets = []
             async for c in cur:
                 targets.append(c["chat_id"])
-            sent = 0
+
+            sent_total = 0
+            errors = 0
+            # Determine payload: prefer full message text; otherwise use caption if forwarding a media
+            text_payload = None
+            if msg.get("text"):
+                text_payload = msg.get("text")
+            elif msg.get("caption"):
+                text_payload = msg.get("caption")
+
+            # If message contains a forwarded media or document, we can forward/copy it to each chat too
+            media_forward_info = None
+            if any(k in msg for k in ("document", "photo", "video")):
+                # current message is media; use its chat and message_id to forward/copy into targets
+                media_forward_info = (msg["chat"]["id"], msg["message_id"])
+
+            # send to targets
             for t in targets:
                 try:
-                    if msg.get("text"):
-                        await tg_send_message(t, msg["text"])
-                        sent += 1
+                    # if it's text (or caption), split into chunks and send each
+                    if text_payload:
+                        chunks = split_text_into_chunks(text_payload, chunk_size=4000)
+                        for chnk in chunks:
+                            try:
+                                await tg_send_message(t, chnk)
+                                await asyncio.sleep(0.08)  # small delay to reduce rate-limit risk
+                            except Exception:
+                                log.exception("broadcast: failed to send chunk to %s", t)
+                        sent_total += 1
+                    elif media_forward_info:
+                        # forward/copy media into the target chat
+                        from_chat_id, mid = media_forward_info
+                        # prefer copyMessage (no forwarded header)
+                        try:
+                            res = await tg_copy(t, from_chat_id, mid)
+                            if res.get("ok"):
+                                sent_total += 1
+                            else:
+                                log.warning("broadcast media copy to %s returned: %s", t, res)
+                                errors += 1
+                        except Exception:
+                            log.exception("broadcast: failed to copy media to %s", t)
+                            errors += 1
                     else:
-                        await tg_send_message(t, msg.get("caption") or "Broadcast message")
-                        sent += 1
+                        # nothing to send (shouldn't happen) - skip
+                        continue
                 except Exception:
-                    log.exception("broadcast failed for %s", t)
-            await tg_send_message(chat_id, f"Broadcast sent to {sent} chats.")
+                    log.exception("broadcast exception for target %s", t)
+                    errors += 1
+                    continue
+
+            # notify owner about result
+            try:
+                await tg_send_message(chat_id, f"Broadcast finished. Sent to {sent_total}/{len(targets)} chats. Errors: {errors}")
+            except Exception:
+                log.exception("broadcast: failed to notify owner")
             return {"ok": True}
 
         # If message contains a file (document/photo/video) => index and forward to DB channel(s)
