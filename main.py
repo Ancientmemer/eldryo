@@ -128,7 +128,7 @@ def dm_start_link_for_query(q: str) -> str:
 def buttons_for_start():
     keyboard = {
         "inline_keyboard": [
-            [{"text": "➕ ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴩ ➕", "url": "https://t.me/{BOT_USERNAME}?startgroup=true"}],
+            [{"text": "➕ ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴩ ➕", "url": "https://t.me/cc_autobot?startgroup=true"}],
             [{"text": "Stats", "callback_data": "stats"}]
         ]
     }
