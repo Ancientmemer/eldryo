@@ -1,4 +1,4 @@
-# main.py (copyMessage version — removes "Forwarded from" header when bot sends files into chats)
+# main.py (PM-delivery version)
 import os
 import logging
 import asyncio
@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 # --- CONFIG via env ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")  # set this to your bot username (without @)
 EXPOSED_URL = os.getenv("EXPOSED_URL", "")
 MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME")  # MUST be provided
@@ -89,7 +90,7 @@ async def tg_send_message(chat_id: int, text: str, reply_markup: dict = None, pa
     return await tg_request("sendMessage", data=data)
 
 
-# keep this for indexing to DB channel (we want DB channel to show forwarded-from info if desired)
+# keep this for indexing to DB channel (we may want DB channel to show forwarded-from)
 async def tg_forward(chat_id: int, from_chat_id: int, message_id: int):
     data = {"chat_id": chat_id, "from_chat_id": from_chat_id, "message_id": message_id}
     return await tg_request("forwardMessage", data=data)
@@ -111,11 +112,23 @@ async def tg_get_chat_member(chat_id: str | int, user_id: int):
     return await tg_request("getChatMember", method="get", params=params)
 
 
+# DM deeplink helper
+def dm_start_link_for_query(q: str) -> str:
+    """Return t.me link that opens bot DM with ?start=<query> payload"""
+    q_enc = urllib.parse.quote(q, safe='') if q else ""
+    if BOT_USERNAME:
+        if q_enc:
+            return f"https://t.me/{BOT_USERNAME}?start={q_enc}"
+        return f"https://t.me/{BOT_USERNAME}"
+    # fallback: user didn't set BOT_USERNAME env
+    return f"https://t.me/{os.getenv('BOT_USERNAME', 'YourBotUsername')}?start={q_enc}"
+
+
 # --- Utilities ---
 def buttons_for_start():
     keyboard = {
         "inline_keyboard": [
-            [{"text": "ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴩ", "url": "http://t.me/{temp.U_NAME}?startgroup=true}"}],
+            [{"text": "➕ ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴩ ➕", "url": "https://t.me/{BOT_USERNAME}?startgroup=true"}],
             [{"text": "Stats", "callback_data": "stats"}]
         ]
     }
@@ -409,12 +422,28 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                     return {"ok": True}
                 page = 1
                 keyboard = make_page_keyboard(results, q, page)
-                await tg_send_message(chat_id, f"The Results For 👉 {q}\nRequested By 👉 {from_user.get('first_name','')}\n\nTap a button to get the DB copy:", reply_markup=keyboard)
+                await tg_send_message(chat_id, f"The Results For 👉 {q}\nRequested By 👉 {from_user.get('first_name','')}\n\nᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links\n\nTap a button to get the DB copy:", reply_markup=keyboard)
                 return {"ok": True}
 
         # /start
         if text.startswith("/start"):
-            await tg_send_message(chat_id, "Hello! I am Eldro Auto Filter Bot. Use /help to see commands\n. ᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links", reply_markup=buttons_for_start())
+            # If payload exists, handle it (user opened bot with ?start=payload)
+            parts = text.split(maxsplit=1)
+            if len(parts) > 1:
+                try:
+                    payload = urllib.parse.unquote(parts[1])
+                    # run search automatically in PM if payload looks like query
+                    results = await search_files_by_name(payload, limit=80)
+                    if results:
+                        keyboard = make_page_keyboard(results, payload, 1)
+                        await tg_send_message(chat_id, f"Results for \"{payload}\":", reply_markup=keyboard)
+                    else:
+                        await tg_send_message(chat_id, f"No results for \"{payload}\".")
+                except Exception:
+                    log.exception("start payload handling failed")
+                    await tg_send_message(chat_id, "Welcome! Use /help to see commands.")
+            else:
+                await tg_send_message(chat_id, "Hello! I am Eldro Auto Filter Bot. Use /help to see commands.\n\n ᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links", reply_markup=buttons_for_start())
             return {"ok": True}
 
         # /help
@@ -426,7 +455,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 "/clone <db_message_id> - clone a DB copy into this chat (or reply to the DB copy with /clone)\n"
                 "/find <filename> - search saved files (also works by typing name directly)\n"
                 "/broadcast - owner only\n"
-                "ᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links\n"
+                "\ɴ\ɴᴩᴏᴡᴇʀᴇᴅ ʙʏ: @ᴊʙ_ʟɪɴᴋꜱ\n"
             )
             await tg_send_message(chat_id, help_text)
             return {"ok": True}
@@ -457,15 +486,19 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                     # older forward structure
                     fwd_chat = reply["forward_from"]["id"]
                     fwd_msg_id = reply.get("message_id")
-                # If we found forwarded info and it matches one of our DB channels, try copying that message into this chat
+                # If we found forwarded info and it matches one of our DB channels, try copying that message into the requester's PM
                 if fwd_chat and fwd_msg_id:
-                    # allow db channel id to be stored as string in CHANNEL_LIST, so compare str forms
                     if any(str(fwd_chat) == str(ch) or str(ch) == str(fwd_chat) for ch in CHANNEL_LIST):
                         try:
-                            # use copy so no "forwarded from" header
-                            fwd = await tg_copy(chat_id, fwd_chat, fwd_msg_id)
+                            dest_user = from_user.get("id")
+                            fwd = await tg_copy(dest_user, fwd_chat, fwd_msg_id)
                             if fwd.get("ok"):
-                                await tg_send_message(chat_id, "Cloned the replied DB copy into this chat.")
+                                # notify requester in PM (already got the file) and in group
+                                await tg_send_message(dest_user, "Cloned the replied DB copy into your PM.")
+                                try:
+                                    await tg_send_message(chat_id, f"✅ {from_user.get('first_name','User')}, I sent the file to your PM.")
+                                except Exception:
+                                    pass
                             else:
                                 await tg_send_message(chat_id, f"Failed to clone replied message: {fwd}")
                         except Exception:
@@ -490,7 +523,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             forwarded = False
             for ch in CHANNEL_LIST:
                 try:
-                    # for cloning into chat, use copy (no forwarded header)
+                    # For explicit id fallback, copy into chat (original behavior) — but we can copy to PM if desired.
                     fwd = await tg_copy(chat_id, ch, db_msg_id)
                     if fwd.get("ok"):
                         forwarded = True
@@ -515,7 +548,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 return {"ok": True}
             page = 1
             keyboard = make_page_keyboard(results, q, page)
-            await tg_send_message(chat_id, f"The Results For 👉 {q}\nRequested By 👉 {from_user.get('first_name','')}\n\nTap a button to get the DB copy:", reply_markup=keyboard)
+            await tg_send_message(chat_id, f"The Results For 👉 {q}\nRequested By 👉 {from_user.get('first_name','')}\n\nᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links\n\nTap a button to get the DB copy:", reply_markup=keyboard)
             return {"ok": True}
 
         # /deletefile (existing)
@@ -576,7 +609,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             fwd_resp = None
             for ch in CHANNEL_LIST:
                 try:
-                    # we keep regular forward to DB channel (so DB shows forwarded-from if desired)
+                    # keep forward to DB channel (so DB shows forwarded-from if desired)
                     fwd_resp = await tg_forward(ch, msg["chat"]["id"], msg["message_id"])
                     if fwd_resp.get("ok"):
                         # Save the db_forward with actual channel id (string or numeric)
@@ -605,7 +638,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             await tg_send_message(chat_id, "Use /help for commands.")
         elif data == "stats":
             if from_id != OWNER_ID:
-                await tg_send_message(chat_id, "Only owner can use /stats.")
+                await tg_send_message(chat_id, "Only owner can view /stats.")
             else:
                 files_count = await db.files.count_documents({})
                 users_count = await db.users.count_documents({})
@@ -640,7 +673,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                     await tg_send_message(dest_chat, f"No files found for \"{q}\".")
                     return {"ok": True}
                 keyboard = make_page_keyboard(results, q, 1)
-                await tg_send_message(dest_chat, f"The Results For 👉 {q}\nRequested By 👉 {cb['from'].get('first_name','')}\n\nᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links \n\nTap a button to get the DB copy:", reply_markup=keyboard)
+                await tg_send_message(dest_chat, f"The Results For 👉 {q}\nRequested By 👉 {cb['from'].get('first_name','')}\n\nᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links\n\nTap a button to get the DB copy:", reply_markup=keyboard)
             except Exception:
                 log.exception("confirmsearch handling failed")
                 await tg_send_message(cb["message"]["chat"]["id"], "Error while handling confirmation.")
@@ -651,16 +684,27 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             try:
                 _, db_chat_str, db_msg_str = data.split(":", 2)
                 db_msg_id = int(db_msg_str)
-                dest_chat = cb["message"]["chat"]["id"]
-                # use copyMessage so no "Forwarded from" header
-                fwd = await tg_copy(dest_chat, db_chat_str, db_msg_id)
+                # destination is requester's private chat
+                dest_user = cb["from"]["id"]
+                # try to copy into user's PM
+                fwd = await tg_copy(dest_user, db_chat_str, db_msg_id)
                 if fwd.get("ok"):
-                    await tg_send_message(dest_chat, "File copied from DB channel.")
+                    # notify in PM (optional)
+                    await tg_send_message(dest_user, "Here is the file you requested (delivered to your PM).")
+                    # notify in group minimally
+                    try:
+                        await tg_send_message(cb["message"]["chat"]["id"], f"✅ File sent to {cb['from'].get('first_name','user')}'s PM.")
+                    except Exception:
+                        pass
                 else:
-                    await tg_send_message(dest_chat, f"Failed to copy file: {fwd.get('description') or fwd}")
+                    # likely user hasn't started the bot — provide DM deeplink in group
+                    err_text = fwd.get("description") or str(fwd)
+                    dm_link = dm_start_link_for_query("")  # simple link to open bot DM
+                    keyboard = {"inline_keyboard": [[{"text": "Open bot in PM", "url": dm_link}]]}
+                    await tg_send_message(cb["message"]["chat"]["id"], f"⚠️ Could not send file to PM: {err_text}\nPlease open the bot in private chat first:", reply_markup=keyboard)
             except Exception:
-                log.exception("filefetch handling failed")
-                await tg_send_message(cb["message"]["chat"]["id"], "Error while fetching file.")
+                log.exception("filefetch->PM handling failed")
+                await tg_send_message(cb["message"]["chat"]["id"], "Error while trying to send file to PM.")
             return {"ok": True}
 
         # sendall callback: data format "sendall:<q_enc>"
@@ -668,24 +712,34 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             try:
                 _, q_enc = data.split(":", 1)
                 q = urllib.parse.unquote(q_enc)
-                dest_chat = cb["message"]["chat"]["id"]
-                await tg_send_message(dest_chat, f"Sending top results for: {q} (this may take a few seconds)...")
+                requester = cb["from"]["id"]
+                dest_user = requester
+                await tg_send_message(cb["message"]["chat"]["id"], f"⏳ Sending top results to {cb['from'].get('first_name','user')}'s PM...")
                 results = await search_files_by_name(q, limit=8)
+                if not results:
+                    await tg_send_message(cb["message"]["chat"]["id"], f"No files found for {q}.")
+                    return {"ok": True}
                 sent = 0
                 for r in results:
                     dbf = r.get("db_forward")
                     if dbf and dbf.get("message_id") and dbf.get("chat_id"):
                         try:
-                            # copy so no forwarded header
-                            fwd = await tg_copy(dest_chat, dbf["chat_id"], int(dbf["message_id"]))
+                            fwd = await tg_copy(dest_user, dbf["chat_id"], int(dbf["message_id"]))
                             if fwd.get("ok"):
                                 sent += 1
                         except Exception:
-                            log.exception("sendall copy failed for %s", dbf)
-                await tg_send_message(dest_chat, f"Send All completed. Sent {sent}/{len(results)} files.")
+                            log.exception("sendall->PM copy failed for %s", dbf)
+                if sent > 0:
+                    await tg_send_message(cb["message"]["chat"]["id"], f"✅ Sent {sent}/{len(results)} files to {cb['from'].get('first_name','user')}'s PM.")
+                    await tg_send_message(dest_user, f"Sent top {sent} results for: {q}")
+                else:
+                    # none sent — user probably hasn't started bot
+                    dm_link = dm_start_link_for_query(q)
+                    keyboard = {"inline_keyboard": [[{"text": "Open bot in PM to receive files", "url": dm_link}]]}
+                    await tg_send_message(cb["message"]["chat"]["id"], "⚠️ Couldn't send files to PM. Ask the user to open the bot in private chat first.", reply_markup=keyboard)
             except Exception:
-                log.exception("sendall handling failed")
-                await tg_send_message(cb["message"]["chat"]["id"], "Error while sending all files.")
+                log.exception("sendall->PM failed")
+                await tg_send_message(cb["message"]["chat"]["id"], "Error while sending files to PM.")
             return {"ok": True}
 
         # page navigation callback: "filepage:<q_enc>:<page>"
@@ -700,8 +754,8 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                     await tg_send_message(chat_id, f"No files found for \"{q}\".")
                     return {"ok": True}
                 keyboard = make_page_keyboard(results, q, page)
-                # For simplicity we send a new message for the requested page
-                await tg_send_message(chat_id, f"The Results For 👉 {q}\nRequested By 👉 {cb['from'].get('first_name','')}\n\nᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links \n\nPage {page}:", reply_markup=keyboard)
+                # send a new message for the requested page
+                await tg_send_message(chat_id, f"The Results For 👉 {q}\nRequested By 👉 {cb['from'].get('first_name','')}\n\nPage {page}:", reply_markup=keyboard)
             except Exception:
                 log.exception("filepage handling failed")
                 await tg_send_message(chat_id, "Error while changing page.")
