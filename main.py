@@ -1,334 +1,132 @@
 import os
 import logging
-import asyncio
-from typing import Optional
-
-from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 import httpx
-from motor.motor_asyncio import AsyncIOMotorClient
-from bson.objectid import ObjectId
-from datetime import datetime, timezone, timedelta
-
-# config from env
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-EXPOSED_URL = os.getenv("EXPOSED_URL", "")
-MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = os.getenv("DB_NAME")  # MUST be provided
-DB_CHANNEL_ID = int(os.getenv("DB_CHANNEL_ID", "0"))
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-AUTO_DELETE_SECONDS = int(os.getenv("AUTO_DELETE_SECONDS", "300"))
-FORCE_SUB_CHANNEL_ID = os.getenv("FORCE_SUB_CHANNEL_ID")  # optional
-FORCE_SUB_OPTIONAL = os.getenv("FORCE_SUB_OPTIONAL", "false").lower() == "true"
-
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var")
-if not MONGO_URI:
-    raise RuntimeError("Set MONGO_URI env var")
-if not DB_NAME:
-    raise RuntimeError("Set DB_NAME env var")
-
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+from config import BOT_TOKEN, OWNER_ID, DB_CHANNEL_ID, AUTO_DELETE_SECONDS
+from db import mongo
+import asyncio
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("eldro-bot")
 
+BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
 app = FastAPI()
-client = AsyncIOMotorClient(MONGO_URI)
-db = client[DB_NAME]
 
-http_client = httpx.AsyncClient(timeout=30.0)
+# ---------------------- TELEGRAM SEND MESSAGE -------------------------------- #
 
+async def send_message(chat_id, text, reply_markup=None):
+    async with httpx.AsyncClient() as client:
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
 
-async def tg_send_message(chat_id: int, text: str, reply_markup: dict = None, parse_mode="HTML"):
-    data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
-    if reply_markup:
-        data["reply_markup"] = reply_markup
-    resp = await http_client.post(f"{TELEGRAM_API}/sendMessage", data=data)
-    return resp.json()
+        r = await client.post(f"{BOT_API}/sendMessage", json=payload)
+        if r.status_code != 200:
+            log.error(f"Telegram send error: {r.text}")
+        return r.json()
 
-
-async def tg_forward(chat_id: int, from_chat_id: int, message_id: int):
-    data = {"chat_id": chat_id, "from_chat_id": from_chat_id, "message_id": message_id}
-    resp = await http_client.post(f"{TELEGRAM_API}/forwardMessage", data=data)
-    return resp.json()
-
-
-async def tg_delete(chat_id: int, message_id: int):
-    data = {"chat_id": chat_id, "message_id": message_id}
-    resp = await http_client.post(f"{TELEGRAM_API}/deleteMessage", data=data)
-    return resp.json()
-
-
-async def tg_get_chat_member(chat_id: int, user_id: int):
-    resp = await http_client.get(f"{TELEGRAM_API}/getChatMember", params={"chat_id": chat_id, "user_id": user_id})
-    return resp.json()
-
-
-def buttons_for_start():
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "Help", "callback_data": "help"}],
-            [{"text": "Stats", "callback_data": "stats"}],
-            [{"text": "Broadcast (owner)", "callback_data": "broadcast"}]
-        ]
-    }
-    return keyboard
-
-
-async def schedule_delete_original(chat_id: int, message_id: int, delay: int):
-    await asyncio.sleep(delay)
-    try:
-        await tg_delete(chat_id, message_id)
-        log.info(f"Deleted message {message_id} from {chat_id}")
-    except Exception as e:
-        log.exception("Error deleting message")
-
+# ---------------------- STARTUP EVENT -------------------------------- #
 
 @app.on_event("startup")
 async def startup_event():
-    # ensure indexes
-    await db.files.create_index("file_id")
-    await db.chats.create_index("chat_id", unique=True)
-    await db.users.create_index("user_id", unique=True)
+    log.info("Connecting to MongoDB...")
+    await mongo.connect()
     log.info("App startup complete")
 
-
-# helper to record chat and user
-async def record_chat_and_user(msg):
-    from_user = msg.get("from", {})
-    chat = msg.get("chat", {})
-    # store chat
-    chat_doc = {"chat_id": chat.get("id"), "type": chat.get("type"), "title": chat.get("title"), "first_seen": datetime.now(timezone.utc)}
-    if chat.get("id"):
-        await db.chats.update_one({"chat_id": chat.get("id")}, {"$setOnInsert": chat_doc}, upsert=True)
-    # store user
-    if from_user.get("id"):
-        user_doc = {"user_id": from_user.get("id"), "username": from_user.get("username"), "first_seen": datetime.now(timezone.utc)}
-        await db.users.update_one({"user_id": from_user.get("id")}, {"$setOnInsert": user_doc}, upsert=True)
-
-
-async def index_file_message(msg):
-    # msg: Telegram message object that contains file
-    chat = msg.get("chat", {})
-    message_id = msg.get("message_id")
-    from_user = msg.get("from", {})
-    file_meta = {}
-    # prefer document > photo > video
-    if "document" in msg:
-        doc = msg["document"]
-        file_meta = {
-            "kind": "document",
-            "file_id": doc.get("file_id"),
-            "file_name": doc.get("file_name"),
-            "mime_type": doc.get("mime_type"),
-            "file_size": doc.get("file_size")
-        }
-    elif "photo" in msg:
-        # take largest
-        photos = msg["photo"]
-        largest = max(photos, key=lambda p: p.get("file_size", 0))
-        file_meta = {"kind": "photo", "file_id": largest.get("file_id")}
-    elif "video" in msg:
-        vid = msg["video"]
-        file_meta = {"kind": "video", "file_id": vid.get("file_id")}
-    else:
-        return None
-
-    record = {
-        "chat_id": chat.get("id"),
-        "chat_type": chat.get("type"),
-        "message_id": message_id,
-        "from_user_id": from_user.get("id"),
-        "from_username": from_user.get("username"),
-        "caption": msg.get("caption"),
-        "file_meta": file_meta,
-        "created_at": datetime.now(timezone.utc)
-    }
-    res = await db.files.insert_one(record)
-    return res.inserted_id
-
-
-@app.post("/webhook")
-async def webhook(request: Request, background_tasks: BackgroundTasks):
-    update = await request.json()
-    # only handle messages + callbacks for simplicity
-    if "message" in update:
-        msg = update["message"]
-        await record_chat_and_user(msg)
-
-        # COMMANDS handled in message.text
-        text = msg.get("text", "") or ""
-        chat_id = msg["chat"]["id"]
-        from_user = msg.get("from", {})
-        user_id = from_user.get("id")
-
-        # Force-sub check (optional)
-        if FORCE_SUB_CHANNEL_ID:
-            try:
-                sub_resp = await tg_get_chat_member(FORCE_SUB_CHANNEL_ID, user_id)
-                ok = sub_resp.get("ok", False)
-                status = sub_resp.get("result", {}).get("status")
-                if not ok or status not in ("member", "creator", "administrator"):
-                    if FORCE_SUB_OPTIONAL:
-                        await tg_send_message(chat_id, "Please join the required channel to use bot features: <b>subscribe required</b>")
-                    else:
-                        await tg_send_message(chat_id, "You must join the required channel to use this bot. Please subscribe and try again.")
-                        return {"ok": True}
-            except Exception:
-                # ignore force-sub errors but warn
-                log.exception("Force-sub check failed")
-
-        # start
-        if text.startswith("/start"):
-            await tg_send_message(chat_id, "Hello! I am Eldryo Auto Filter Bot. Use /help to see commands. \n\nPowered by: @jb_links", reply_markup=buttons_for_start())
-            return {"ok": True}
-
-        # help
-        if text.startswith("/help"):
-            help_text = (
-                "/start - open menu\n"
-                "/help - this message\n"
-                "/stats - show total files/users/groups (owner or admin)\n"
-                "/broadcast - owner only (send broadcast to all indexed chats)\n"
-                "Forward a file to any group - bot will index & forward to DB channel.\n"
-                "To delete a file: forward the DB-channel copy to the bot in private and reply with /deletefile\n"
-            )
-            await tg_send_message(chat_id, help_text)
-            return {"ok": True}
-
-        # stats
-        if text.startswith("/stats"):
-            # allow only owner or chat admins for sensitive usage; here allow owner only
-            if user_id != OWNER_ID:
-                await tg_send_message(chat_id, "Only owner can use /stats.")
-                return {"ok": True}
-            files_count = await db.files.count_documents({})
-            users_count = await db.users.count_documents({})
-            chats_count = await db.chats.count_documents({"type": "group"}) + await db.chats.count_documents({"type": "supergroup"})
-            stats_text = f"Files: {files_count}\nUsers: {users_count}\nGroups: {chats_count}"
-            await tg_send_message(chat_id, stats_text)
-            return {"ok": True}
-
-        # broadcast (owner only) - start a broadcast flow
-        if text.startswith("/broadcast"):
-            if user_id != OWNER_ID:
-                await tg_send_message(chat_id, "Only owner can use /broadcast.")
-                return {"ok": True}
-            # Mark in a "sessions" collection that owner is starting broadcast
-            await db.sessions.update_one({"user_id": user_id}, {"$set": {"broadcast_pending": True, "created_at": datetime.now(timezone.utc)}}, upsert=True)
-            await tg_send_message(chat_id, "Send the message to broadcast now (reply with text or forward message). It will be sent to all indexed chats.")
-            return {"ok": True}
-
-        # deletefile: user should reply to forwarded DB channel message OR forward it to bot and run /deletefile
-        if text.startswith("/deletefile"):
-            # require that message is a reply to a forwarded message that originated from our bot (DB channel)
-            if "reply_to_message" in msg:
-                fwd = msg["reply_to_message"]
-                # try to find the doc by matching message_id and chat_id in files (bot stored forward info earlier)
-                # if this reply is in private chat, the reply_to_message likely contains forward_from_message_id fields
-                original_forward_chat = fwd.get("forward_from_chat", {})
-                if original_forward_chat and original_forward_chat.get("id") == DB_CHANNEL_ID:
-                    # take forwarded message id
-                    forwarded_msg_id = fwd.get("message_id")
-                    # find file record by forwarded_id
-                    doc = await db.files.find_one({"db_forward.chat_id": DB_CHANNEL_ID, "db_forward.message_id": forwarded_msg_id})
-                    if not doc:
-                        await tg_send_message(chat_id, "File record not found in DB for this forwarded message.")
-                        return {"ok": True}
-                    # now attempt delete original message in original chat
-                    orig_chat_id = doc.get("chat_id")
-                    orig_msg_id = doc.get("message_id")
-                    # delete original message (if bot has permission)
-                    d1 = await tg_delete(orig_chat_id, orig_msg_id)
-                    # delete forwarded copy in DB channel
-                    d2 = await tg_delete(DB_CHANNEL_ID, forwarded_msg_id)
-                    await tg_send_message(chat_id, "Attempted deletion. Check DB channel & original chat. Note: bot must be admin to delete messages.")
-                    return {"ok": True}
-            await tg_send_message(chat_id, "Reply to the forwarded DB-channel message (the one bot forwarded) with /deletefile to delete.")
-            return {"ok": True}
-
-        # If the user has a broadcast pending (owner): send broadcast message
-        session = await db.sessions.find_one({"user_id": user_id})
-        if session and session.get("broadcast_pending"):
-            # broadcast the text or forwarded message
-            # if this message is a forwarded message, we can forward that message to all indexed chats; otherwise send text
-            await db.sessions.delete_one({"user_id": user_id})
-            # gather all chat ids (for safety, only supergroups/groups)
-            cur = db.chats.find({})
-            targets = []
-            async for c in cur:
-                targets.append(c["chat_id"])
-            # do broadcast
-            sent = 0
-            for t in targets:
-                try:
-                    if "forward_from_message_id" in msg and "forward_from" in msg:
-                        # forwarding the forwarded message isn't straightforward; so send text if we have text
-                        if text:
-                            await tg_send_message(t, text)
-                    else:
-                        if text:
-                            await tg_send_message(t, text)
-                    sent += 1
-                except Exception:
-                    log.exception("broadcast failed for %s", t)
-            await tg_send_message(chat_id, f"Broadcast sent to {sent} chats.")
-            return {"ok": True}
-
-        # if message contains a file, index and forward to DB channel
-        if any(k in msg for k in ("document", "photo", "video")):
-            inserted_id = await index_file_message(msg)
-            # forward to DB channel
-            try:
-                fwd_resp = await tg_forward(DB_CHANNEL_ID, msg["chat"]["id"], msg["message_id"])
-                if fwd_resp.get("ok"):
-                    # store forward info in db.files doc
-                    await db.files.update_one({"_id": ObjectId(inserted_id)}, {"$set": {"db_forward": {"chat_id": DB_CHANNEL_ID, "message_id": fwd_resp["result"]["message_id"]}}})
-                else:
-                    log.warning("forward failed: %s", fwd_resp)
-            except Exception:
-                log.exception("forward exception")
-
-            # Schedule deleting the original message after AUTO_DELETE_SECONDS (group message), only if chat is group/supergroup
-            chat_type = msg["chat"].get("type")
-            if chat_type in ("group", "supergroup"):
-                # schedule background deletion
-                background_tasks.add_task(schedule_delete_original, msg["chat"]["id"], msg["message_id"], AUTO_DELETE_SECONDS)
-
-            await tg_send_message(chat_id, "File indexed and forwarded to DB channel.")
-            return {"ok": True}
-
-    # Callback query button press handling (simple)
-    if "callback_query" in update:
-        cb = update["callback_query"]
-        data = cb.get("data")
-        from_id = cb["from"]["id"]
-        chat_id = cb["message"]["chat"]["id"]
-        if data == "help":
-            await tg_send_message(chat_id, "Use /help for commands.")
-        elif data == "stats":
-            if from_id != OWNER_ID:
-                await tg_send_message(chat_id, "Only owner can view stats.")
-            else:
-                files_count = await db.files.count_documents({})
-                users_count = await db.users.count_documents({})
-                chats_count = await db.chats.count_documents({"type": "group"}) + await db.chats.count_documents({"type": "supergroup"})
-                await tg_send_message(chat_id, f"Files: {files_count}\nUsers: {users_count}\nGroups: {chats_count}")
-        elif data == "broadcast":
-            if from_id != OWNER_ID:
-                await tg_send_message(chat_id, "Only owner can broadcast.")
-            else:
-                await db.sessions.update_one({"user_id": from_id}, {"$set": {"broadcast_pending": True, "created_at": datetime.now(timezone.utc)}}, upsert=True)
-                await tg_send_message(chat_id, "Send the broadcast message now (text or forward).")
-        return {"ok": True}
-
-    return {"ok": True}
-
+# ---------------------- WEBHOOK SETUP -------------------------------- #
 
 @app.get("/set_webhook")
 async def set_webhook():
-    if not EXPOSED_URL:
-        raise HTTPException(status_code=400, detail="Set EXPOSED_URL env var first.")
-    webhook_url = f"{EXPOSED_URL}/webhook"
-    resp = await http_client.get(f"{TELEGRAM_API}/setWebhook", params={"url": webhook_url, "allowed_updates": '["message","callback_query"]'})
-    return resp.json()
+    webhook_url = f"{os.getenv('EXPOSED_URL')}/webhook"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{BOT_API}/setWebhook",
+            params={"url": webhook_url, "allowed_updates": ["message", "callback_query"]}
+        )
+        return JSONResponse(r.json())
+
+# ---------------------- MAIN WEBHOOK -------------------------------- #
+
+@app.post("/webhook")
+async def webhook(req: Request):
+    data = await req.json()
+
+    if "message" in data:
+        message = data["message"]
+        chat_id = message["chat"]["id"]
+        user_id = message["from"]["id"]
+        text = message.get("text", "")
+
+        # -------------------- /start -------------------- #
+        if text == "/start":
+            buttons = {
+                "inline_keyboard": [
+                    [{"text": "Help ⚙️", "callback_data": "help"}],
+                    [{"text": "About 👑", "callback_data": "about"}]
+                ]
+            }
+            await send_message(chat_id, "<b>Welcome to Eldro Auto Filter Bot</b>", buttons)
+
+        # -------------------- /help -------------------- #
+        elif text == "/help":
+            await send_message(chat_id,
+                               "<b>Available Commands:</b>\n/start\n/help\n/stats\n/broadcast")
+
+        # -------------------- /stats -------------------- #
+        elif text == "/stats":
+            total_files = await mongo.count_files()
+            total_users = await mongo.count_users()
+            total_groups = await mongo.count_groups()
+
+            msg = (
+                f"<b>📊 Bot Stats</b>\n\n"
+                f"Total Files: <b>{total_files}</b>\n"
+                f"Total Users: <b>{total_users}</b>\n"
+                f"Total Groups: <b>{total_groups}</b>"
+            )
+            await send_message(chat_id, msg)
+
+        # -------------------- BROADCAST -------------------- #
+        elif text.startswith("/broadcast") and str(user_id) == OWNER_ID:
+            bc_msg = text.replace("/broadcast", "").strip()
+            if not bc_msg:
+                return await send_message(chat_id, "Usage:\n/broadcast Your message here")
+            users = await mongo.get_all_users()
+            for uid in users:
+                await send_message(uid, bc_msg)
+                await asyncio.sleep(0.1)
+            await send_message(chat_id, "Broadcast completed ✔️")
+
+        # -------------------- FILE INDEXING (Forward to DB Channel) -------------------- #
+        elif "document" in message or "video" in message or "photo" in message:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"{BOT_API}/forwardMessage",
+                    data={
+                        "chat_id": DB_CHANNEL_ID,
+                        "from_chat_id": chat_id,
+                        "message_id": message["message_id"]
+                    }
+                )
+            await send_message(chat_id, "File saved to index ✔️")
+
+        # -------------------- AUTO DELETE MESSAGE -------------------- #
+        if AUTO_DELETE_SECONDS > 0:
+            async with httpx.AsyncClient() as client:
+                await asyncio.sleep(AUTO_DELETE_SECONDS)
+                await client.get(
+                    f"{BOT_API}/deleteMessage",
+                    params={"chat_id": chat_id, "message_id": message["message_id"]}
+                )
+
+    return {"ok": True}
+
+@app.get("/")
+def home():
+    return {"status": "Running Eldro Auto Filter Bot"}
