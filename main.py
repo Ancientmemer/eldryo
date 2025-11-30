@@ -115,7 +115,7 @@ async def tg_get_chat_member(chat_id: str | int, user_id: int):
 def buttons_for_start():
     keyboard = {
         "inline_keyboard": [
-            [{"text": "ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴩ", "url": f'http://t.me/{temp.U_NAME}?startgroup=true}'],
+            [{"text": "ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴩ", "url": "http://t.me/{temp.U_NAME}?startgroup=true}"}],
             [{"text": "Stats", "callback_data": "stats"}]
         ]
     }
