@@ -51,7 +51,7 @@ async def tg_request(path: str, method: str = "post", params: dict = None, data:
         if method.lower() == "get":
             r = await http_client.get(url, params=params)
         else:
-            r = await http_client.post(url, data=data)
+            r = await http_client.post(url, json=data)
         # try json
         try:
             resp = r.json()
