@@ -1,4 +1,4 @@
-# main.py (complete patched version)
+# main.py (copyMessage version — removes "Forwarded from" header when bot sends files into chats)
 import os
 import logging
 import asyncio
@@ -21,8 +21,7 @@ DB_NAME = os.getenv("DB_NAME")  # MUST be provided
 # Legacy single DB channel (kept for compatibility)
 DB_CHANNEL_ID = os.getenv("DB_CHANNEL_ID", "0")
 
-# New: support multiple DB channels (space-separated), like VJ-FILTER-BOT's CHANNELS variable
-# Example: CHANNELS="-100123... -100456..." or channel usernames
+# New: support multiple DB channels (space-separated)
 CHANNELS = os.getenv("CHANNELS", "").strip()
 if CHANNELS:
     CHANNEL_LIST = [c.strip() for c in CHANNELS.split() if c.strip()]
@@ -34,7 +33,7 @@ AUTO_DELETE_SECONDS = int(os.getenv("AUTO_DELETE_SECONDS", "300"))
 FORCE_SUB_CHANNEL_ID = os.getenv("FORCE_SUB_CHANNEL_ID", "")
 FORCE_SUB_OPTIONAL = os.getenv("FORCE_SUB_OPTIONAL", "false").lower() == "true"
 
-# Basic premium stub (unused by default)
+# Premium stub (unused by default)
 ENABLE_PREMIUM = os.getenv("ENABLE_PREMIUM", "false").lower() == "true"
 PREMIUM_TOKENS = [t.strip() for t in os.getenv("PREMIUM_TOKENS", "").split(",") if t.strip()]
 
@@ -60,6 +59,7 @@ http_client = httpx.AsyncClient(timeout=30.0)
 
 # Pagination constant
 RESULTS_PER_PAGE = 8
+
 
 # --- TELEGRAM helpers (with checks) ---
 async def tg_request(path: str, method: str = "post", params: dict = None, data: dict = None) -> Dict[str, Any]:
@@ -89,9 +89,16 @@ async def tg_send_message(chat_id: int, text: str, reply_markup: dict = None, pa
     return await tg_request("sendMessage", data=data)
 
 
+# keep this for indexing to DB channel (we want DB channel to show forwarded-from info if desired)
 async def tg_forward(chat_id: int, from_chat_id: int, message_id: int):
     data = {"chat_id": chat_id, "from_chat_id": from_chat_id, "message_id": message_id}
     return await tg_request("forwardMessage", data=data)
+
+
+# copyMessage: creates a copy without "Forwarded from" header
+async def tg_copy(chat_id: int, from_chat_id: int, message_id: int):
+    data = {"chat_id": chat_id, "from_chat_id": from_chat_id, "message_id": message_id}
+    return await tg_request("copyMessage", data=data)
 
 
 async def tg_delete(chat_id: int, message_id: int):
@@ -108,9 +115,8 @@ async def tg_get_chat_member(chat_id: str | int, user_id: int):
 def buttons_for_start():
     keyboard = {
         "inline_keyboard": [
-            [{"text": "Help", "callback_data": "help"}],
-            [{"text": "Stats", "callback_data": "stats"}],
-            [{"text": "Broadcast (owner)", "callback_data": "broadcast"}]
+            [{"text": "ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴩ", "url": f'http://t.me/{temp.U_NAME}?startgroup=true}'],
+            [{"text": "Stats", "callback_data": "stats"}]
         ]
     }
     return keyboard
@@ -207,8 +213,23 @@ async def search_files_by_name(query: str, limit: int = 100) -> List[dict]:
     async for doc in cur:
         fm = doc.get("file_meta", {})
         name = fm.get("file_name") or fm.get("file_id") or "(unknown)"
-        results.append({"_id": str(doc.get("_id")), "name": name, "db_forward": doc.get("db_forward")})
+        results.append({"_id": str(doc.get("_id")), "name": name, "db_forward": doc.get("db_forward"), "size": fm.get("file_size")})
     return results
+
+
+# helper: pretty file size
+def format_size(size):
+    if not size:
+        return "Unknown"
+    try:
+        size = float(size)
+    except Exception:
+        return str(size)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} TB"
 
 
 # Pagination helpers
@@ -227,16 +248,19 @@ def make_page_keyboard(results: list, query: str, page: int):
     # Send All button
     keyboard_rows.append([{"text": "Send All", "callback_data": f"sendall:{encoded_q}"}])
 
-    # result buttons (8 per page)
+    # result buttons (8 per page) — include size in label
     for r in slice_results:
         name = r["name"]
+        size_text = format_size(r.get("size"))
+        label = f"{name} ({size_text})"
+        if len(label) > 80:
+            label = label[:77] + "..."
         dbf = r.get("db_forward")
         if dbf and dbf.get("message_id") and dbf.get("chat_id"):
             cb = f"filefetch:{dbf['chat_id']}:{dbf['message_id']}"
-            # keep the button label reasonable length; Telegram truncates long labels
-            keyboard_rows.append([{"text": (name[:70] + '...') if len(name) > 70 else name, "callback_data": cb}])
+            keyboard_rows.append([{"text": label, "callback_data": cb}])
         else:
-            keyboard_rows.append([{"text": f"{(name[:60] + '...') if len(name) > 60 else name} (no DB copy)", "callback_data": "noop"}])
+            keyboard_rows.append([{"text": f"{label} (no DB copy)", "callback_data": "noop"}])
 
     # navigation row: PREV | PAGE X/Y | NEXT
     nav_row = []
@@ -309,6 +333,55 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             except Exception:
                 log.exception("Force-sub check failed (ignored)")
 
+        # --- Detect forwarded-from-DB messages and replace with original (auto) ---
+        try:
+            fwd_info = msg.get("forward_from_chat") or msg.get("forward_from")
+            if fwd_info and fwd_info.get("id"):
+                fwd_chat_id = str(fwd_info.get("id"))
+                # Only act when forwarded-from is one of our configured DB channels
+                if any(str(c) == fwd_chat_id or str(c) == fwd_chat_id for c in CHANNEL_LIST):
+                    # Message id of the forwarded message inside this chat (the one user forwarded)
+                    forwarded_msg_id_in_chat = msg.get("message_id")
+                    # Try to obtain the original DB message id
+                    original_db_msg_id = None
+                    # Prefer forward_from_message_id if available
+                    if msg.get("forward_from_message_id"):
+                        original_db_msg_id = msg.get("forward_from_message_id")
+                    else:
+                        # fallback: search DB by matching db_forward.message_id == forwarded_msg_id_in_chat
+                        doc = await db.files.find_one({"db_forward.message_id": forwarded_msg_id_in_chat})
+                        if doc and doc.get("db_forward"):
+                            original_db_msg_id = doc["db_forward"].get("message_id")
+                            # use canonical chat id from DB record if present
+                            fwd_chat_id = doc["db_forward"].get("chat_id") or fwd_chat_id
+
+                    if original_db_msg_id:
+                        # Attempt to delete the forwarded copy in this chat
+                        delete_ok = False
+                        try:
+                            del_resp = await tg_delete(chat_id, forwarded_msg_id_in_chat)
+                            if del_resp.get("ok"):
+                                delete_ok = True
+                        except Exception:
+                            log.exception("Failed to delete forwarded message")
+
+                        # Copy the real original from DB channel into this chat (copyMessage => no forwarded header)
+                        try:
+                            fwd = await tg_copy(chat_id, fwd_chat_id, int(original_db_msg_id))
+                            if fwd.get("ok"):
+                                if delete_ok:
+                                    await tg_send_message(chat_id, "Replaced forwarded copy with original DB file.")
+                                else:
+                                    await tg_send_message(chat_id, "Copied original DB file (couldn't delete the forwarded copy — check bot permissions).")
+                            else:
+                                await tg_send_message(chat_id, f"Failed to copy original DB file: {fwd}")
+                        except Exception:
+                            log.exception("Error copying original DB file")
+                            await tg_send_message(chat_id, "Error while copying the original DB file.")
+                        # continue processing other handlers if needed
+        except Exception:
+            log.exception("forward-replace handling failed")
+
         # --- implicit search (no /find) with group confirmation ---
         if is_search_query(text):
             q = text.strip()
@@ -341,7 +414,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 
         # /start
         if text.startswith("/start"):
-            await tg_send_message(chat_id, "Hello! I am Eldro Auto Filter Bot. Use /help to see commands.", reply_markup=buttons_for_start())
+            await tg_send_message(chat_id, "Hello! I am Eldro Auto Filter Bot. Use /help to see commands\n. ᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links", reply_markup=buttons_for_start())
             return {"ok": True}
 
         # /help
@@ -350,9 +423,10 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 "/start - open menu\n"
                 "/help - this message\n"
                 "/stats - files/users/groups (owner only)\n"
-                "/clone <db_message_id> - clone a DB copy into this chat\n"
+                "/clone <db_message_id> - clone a DB copy into this chat (or reply to the DB copy with /clone)\n"
                 "/find <filename> - search saved files (also works by typing name directly)\n"
                 "/broadcast - owner only\n"
+                "ᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links\n"
             )
             await tg_send_message(chat_id, help_text)
             return {"ok": True}
@@ -368,11 +442,44 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             await tg_send_message(chat_id, f"Files: {files_count}\nUsers: {users_count}\nGroups: {groups_count}")
             return {"ok": True}
 
-        # /clone <message_id>  - clone DB copy into this chat by DB message id
+        # /clone <message_id> or reply-to-DB-message with /clone
         if text.startswith("/clone"):
+            # if user replied to a forwarded DB-channel message, use that forwarded message id
+            reply = msg.get("reply_to_message")
+            if reply:
+                # Prefer forwarded info (forward_from_chat or forward_from) from the replied message
+                fwd_chat = None
+                fwd_msg_id = None
+                if reply.get("forward_from_chat") and reply["forward_from_chat"].get("id"):
+                    fwd_chat = reply["forward_from_chat"]["id"]
+                    fwd_msg_id = reply.get("message_id")
+                elif reply.get("forward_from") and isinstance(reply.get("forward_from"), dict) and reply["forward_from"].get("id"):
+                    # older forward structure
+                    fwd_chat = reply["forward_from"]["id"]
+                    fwd_msg_id = reply.get("message_id")
+                # If we found forwarded info and it matches one of our DB channels, try copying that message into this chat
+                if fwd_chat and fwd_msg_id:
+                    # allow db channel id to be stored as string in CHANNEL_LIST, so compare str forms
+                    if any(str(fwd_chat) == str(ch) or str(ch) == str(fwd_chat) for ch in CHANNEL_LIST):
+                        try:
+                            # use copy so no "forwarded from" header
+                            fwd = await tg_copy(chat_id, fwd_chat, fwd_msg_id)
+                            if fwd.get("ok"):
+                                await tg_send_message(chat_id, "Cloned the replied DB copy into this chat.")
+                            else:
+                                await tg_send_message(chat_id, f"Failed to clone replied message: {fwd}")
+                        except Exception:
+                            log.exception("reply-clone copy failed")
+                            await tg_send_message(chat_id, "Error while cloning the replied message.")
+                        return {"ok": True}
+                    else:
+                        # Replied message was forwarded but not from our configured DB channels; still try copying by ID across channels
+                        pass
+
+            # Fallback: numeric id passed as argument: /clone 12345
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
-                await tg_send_message(chat_id, "Usage: /clone <db_message_id>\nExample: /clone 12345")
+                await tg_send_message(chat_id, "Usage: /clone <db_message_id> or reply to the DB copy with /clone")
                 return {"ok": True}
             msgid_str = parts[1].strip()
             try:
@@ -383,16 +490,17 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             forwarded = False
             for ch in CHANNEL_LIST:
                 try:
-                    fwd = await tg_forward(chat_id, ch, db_msg_id)
+                    # for cloning into chat, use copy (no forwarded header)
+                    fwd = await tg_copy(chat_id, ch, db_msg_id)
                     if fwd.get("ok"):
                         forwarded = True
                         break
                 except Exception:
-                    log.exception("clone forward failed for channel %s", ch)
+                    log.exception("clone copy failed for channel %s", ch)
             if forwarded:
                 await tg_send_message(chat_id, "Cloned file from DB channel.")
             else:
-                await tg_send_message(chat_id, "Failed to clone: message not found or bot lacks permission to forward.")
+                await tg_send_message(chat_id, "Failed to clone: message not found or bot lacks permission to copy/forward.")
             return {"ok": True}
 
         # /find <filename>  — explicit search command (paged)
@@ -415,7 +523,6 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             reply = msg.get("reply_to_message")
             if reply:
                 fwd_chat = None
-                # handle DB_CHANNEL_ID or first channel in list
                 try:
                     primary_db_ch = CHANNEL_LIST[0] if CHANNEL_LIST else DB_CHANNEL_ID
                 except Exception:
@@ -469,6 +576,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             fwd_resp = None
             for ch in CHANNEL_LIST:
                 try:
+                    # we keep regular forward to DB channel (so DB shows forwarded-from if desired)
                     fwd_resp = await tg_forward(ch, msg["chat"]["id"], msg["message_id"])
                     if fwd_resp.get("ok"):
                         # Save the db_forward with actual channel id (string or numeric)
@@ -497,7 +605,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             await tg_send_message(chat_id, "Use /help for commands.")
         elif data == "stats":
             if from_id != OWNER_ID:
-                await tg_send_message(chat_id, "Only owner can view stats.")
+                await tg_send_message(chat_id, "Only owner can use /stats.")
             else:
                 files_count = await db.files.count_documents({})
                 users_count = await db.users.count_documents({})
@@ -532,7 +640,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                     await tg_send_message(dest_chat, f"No files found for \"{q}\".")
                     return {"ok": True}
                 keyboard = make_page_keyboard(results, q, 1)
-                await tg_send_message(dest_chat, f"The Results For 👉 {q}\nRequested By 👉 {cb['from'].get('first_name','')}\n\nTap a button to get the DB copy:", reply_markup=keyboard)
+                await tg_send_message(dest_chat, f"The Results For 👉 {q}\nRequested By 👉 {cb['from'].get('first_name','')}\n\nᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links \n\nTap a button to get the DB copy:", reply_markup=keyboard)
             except Exception:
                 log.exception("confirmsearch handling failed")
                 await tg_send_message(cb["message"]["chat"]["id"], "Error while handling confirmation.")
@@ -544,11 +652,12 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 _, db_chat_str, db_msg_str = data.split(":", 2)
                 db_msg_id = int(db_msg_str)
                 dest_chat = cb["message"]["chat"]["id"]
-                fwd = await tg_forward(dest_chat, db_chat_str, db_msg_id)
+                # use copyMessage so no "Forwarded from" header
+                fwd = await tg_copy(dest_chat, db_chat_str, db_msg_id)
                 if fwd.get("ok"):
-                    await tg_send_message(dest_chat, "File forwarded from DB channel.")
+                    await tg_send_message(dest_chat, "File copied from DB channel.")
                 else:
-                    await tg_send_message(dest_chat, f"Failed to forward file: {fwd.get('description') or fwd}")
+                    await tg_send_message(dest_chat, f"Failed to copy file: {fwd.get('description') or fwd}")
             except Exception:
                 log.exception("filefetch handling failed")
                 await tg_send_message(cb["message"]["chat"]["id"], "Error while fetching file.")
@@ -567,11 +676,12 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                     dbf = r.get("db_forward")
                     if dbf and dbf.get("message_id") and dbf.get("chat_id"):
                         try:
-                            fwd = await tg_forward(dest_chat, dbf["chat_id"], int(dbf["message_id"]))
+                            # copy so no forwarded header
+                            fwd = await tg_copy(dest_chat, dbf["chat_id"], int(dbf["message_id"]))
                             if fwd.get("ok"):
                                 sent += 1
                         except Exception:
-                            log.exception("sendall forward failed for %s", dbf)
+                            log.exception("sendall copy failed for %s", dbf)
                 await tg_send_message(dest_chat, f"Send All completed. Sent {sent}/{len(results)} files.")
             except Exception:
                 log.exception("sendall handling failed")
@@ -591,7 +701,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                     return {"ok": True}
                 keyboard = make_page_keyboard(results, q, page)
                 # For simplicity we send a new message for the requested page
-                await tg_send_message(chat_id, f"The Results For 👉 {q}\nRequested By 👉 {cb['from'].get('first_name','')}\n\nPage {page}:", reply_markup=keyboard)
+                await tg_send_message(chat_id, f"The Results For 👉 {q}\nRequested By 👉 {cb['from'].get('first_name','')}\n\nᴩᴏᴡᴇʀᴇᴅ ʙʏ: @jb_links \n\nPage {page}:", reply_markup=keyboard)
             except Exception:
                 log.exception("filepage handling failed")
                 await tg_send_message(chat_id, "Error while changing page.")
