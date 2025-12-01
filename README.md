@@ -11,5 +11,3 @@
 ᴅᴇᴠᴇʟᴏᴩᴇᴅ ʙʏ: [『🔱』Mr Eldro](https://t.me/iam_eldro)<br>
 ᴛᴇʟᴇɢʀᴀᴍ ʙᴏᴛ: [Eldryo](https://t.me/cc_autobot)<br>
 ᴩᴏᴡᴇʀᴇᴅ ʙʏ: [JB LINKS](https://t.me/jb_links)<br>
-
-<marquee>Thanks For Visiting</marquee>
